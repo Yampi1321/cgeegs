@@ -170,5 +170,5 @@ jobs:
               loops           = "$next"
             }
           } | ConvertTo-Json -Depth 5
-          Invoke-RestMethod -Method POST -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/windows-rdp-tailscale-A.yml/dispatches" -Headers @{ Authorization="Bearer $token"; "Accept"="application/vnd.github+json" } -Body $body
+          Invoke-RestMethod -Method POST -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/windows-rdp-tailscale-A.yml/dispatches" -Headers @{ Authorization="Bearer $token"; "Accept"="application/vnd.github+json" } -ContentType "application/json" -Body $body
           Write-Host "Dispatched workflow A (loops next=$next)."

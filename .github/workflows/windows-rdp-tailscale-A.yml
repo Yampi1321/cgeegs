@@ -13,8 +13,8 @@ on:
         description: "Tailscale auth key (reusable or ephemeral)"
         required: true
       gh_api_token:
-        description: "GitHub Personal Access Token (classic; scopes: repo, workflow)"
-        required: true
+        description: "Optional GitHub PAT (classic; repo, workflow). Leave blank to use repo secret GH_PAT."
+        required: false
       test_mode:
         description: "Run 5-minute test loop"
         type: boolean
@@ -58,7 +58,7 @@ jobs:
           RAW_TAILNET:  ${{ inputs.ts_tailnet }}
           RAW_APIKEY:   ${{ inputs.ts_api_key }}
           RAW_AUTHKEY:  ${{ inputs.ts_authkey }}
-          RAW_PAT:      ${{ inputs.gh_api_token }}
+          RAW_PAT:      ${{ secrets.GH_PAT || inputs.gh_api_token }}
           RAW_TEST:     ${{ inputs.test_mode && 'true' || 'false' }}
           RAW_RUNTIME:  ${{ inputs.runtime_minutes || '355' }}
           RAW_LOOPS:    ${{ inputs.loops || '0' }}
@@ -77,8 +77,11 @@ jobs:
           if ($runtime -gt 360) { $runtime = 355 }
           $loops = ToIntOr $env:RAW_LOOPS 0
           if ($loops -lt 0) { $loops = 0 }
-          if (-not $tailnet -or -not $apiKey -or -not $authKey -or -not $pat) {
+          if (-not $tailnet -or -not $apiKey -or -not $authKey) {
             Write-Warning "⚠️ One or more required inputs are missing!"
+          }
+          if (-not $pat) {
+            Write-Warning "⚠️ No GitHub PAT available (repo secret GH_PAT missing and no input). Workflow handoff will be skipped."
           }
           "tailnet=$($tailnet ?? 'dummy-tailnet')" | Out-File -Append $env:GITHUB_OUTPUT
           "apikey=$($apiKey ?? 'dummy-apikey')"   | Out-File -Append $env:GITHUB_OUTPUT
@@ -86,6 +89,7 @@ jobs:
           "pat=$($pat ?? 'dummy-pat')"             | Out-File -Append $env:GITHUB_OUTPUT
           "runtime=$runtime" | Out-File -Append $env:GITHUB_OUTPUT
           "loops=$loops"     | Out-File -Append $env:GITHUB_OUTPUT
+          "testmode=$($isTest.ToString().ToLower())" | Out-File -Append $env:GITHUB_OUTPUT
 
       # ===================== Install Tailscale =====================
       - name: ⚙️ Install Tailscale (if missing) & show version
@@ -163,25 +167,42 @@ jobs:
           Start-Sleep -Seconds 3
           & $ztExe -q listnetworks
 
-      # ===================== Download & Extract Firefox Portable =====================
+      # ===================== Download & Extract Firefox Portable (robust) =====================
       - name: 📥 Download & Extract Firefox Portable to interactive user profile
         run: |
+          $interactiveUserFolder = "C:\Users\Bullettemporary"
           try {
             $explorerProcess = Get-Process explorer -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($explorerProcess) {
-              $interactiveUserFolder = Split-Path -Parent $env:TEMP
-            } else {
-              $interactiveUserFolder = "C:\Users\Bullettemporary"
-            }
-            $dst = Join-Path $interactiveUserFolder "Downloads\FirefoxPortable"
-          } catch {
-            $dst = "C:\Users\Bullettemporary\Downloads\FirefoxPortable"
-          }
+            if ($explorerProcess) { $interactiveUserFolder = Split-Path -Parent $env:TEMP }
+          } catch {}
+          $dst = Join-Path $interactiveUserFolder "Downloads\FirefoxPortable"
           $zip = "$env:TEMP\FirefoxPortable.zip"
+          New-Item -ItemType Directory -Force -Path (Split-Path $dst -Parent) | Out-Null
           if (Test-Path $dst) { Remove-Item -Recurse -Force $dst }
           if (Test-Path $zip) { Remove-Item -Force $zip }
-          Invoke-WebRequest -Uri "https://www.dropbox.com/scl/fo/9n644cwuq4gpw6123dpph/AJvMFsxMkDWK_0FYWDjzJE8?rlkey=i6k3lpcz6t5k0pfaf7h6co8g2&dl=1" -OutFile $zip -UseBasicParsing
-          Expand-Archive -Path $zip -DestinationPath (Split-Path $dst -Parent) -Force
+          $url = "https://www.dropbox.com/scl/fo/9n644cwuq4gpw6123dpph/AJvMFsxMkDWK_0FYWDjzJE8?rlkey=i6k3lpcz6t5k0pfaf7h6co8g2&dl=1"
+          $ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $maxTries = 6
+          $ok = $false
+          for ($i = 1; $i -le $maxTries; $i++) {
+            try {
+              Write-Host "Download attempt $i/$maxTries ..."
+              $ProgressPreference = 'SilentlyContinue'
+              Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -UserAgent $ua -TimeoutSec 1800 -ErrorAction Stop
+              $len = (Get-Item $zip).Length
+              if ($len -gt 10MB) { Write-Host ("Downloaded {0:N1} MB" -f ($len/1MB)); $ok = $true; break }
+              throw "File too small: $len bytes"
+            } catch {
+              Write-Warning "Attempt $i failed: $($_.Exception.Message)"
+              Remove-Item -Force $zip -ErrorAction SilentlyContinue
+              if ($i -lt $maxTries) { Start-Sleep -Seconds ([math]::Min(60, 5 * $i)) }
+            }
+          }
+          if (-not $ok) { throw "Failed to download Firefox Portable after $maxTries attempts" }
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          Expand-Archive -Path $zip -DestinationPath $dst -Force
+          if (-not (Test-Path (Join-Path $dst "FirefoxPortable.exe"))) { throw "FirefoxPortable.exe missing after extraction" }
           Write-Host "Firefox Portable extracted to $dst"
 
       # ===================== Keep alive loop =====================
@@ -218,18 +239,15 @@ jobs:
           if ($loops -eq 1) { Write-Host "Loops finished; not dispatching."; exit 0 }
           if ($loops -gt 1) { $next=$loops-1 } else { $next=0 }
           $token="${{ steps.cfg.outputs.pat }}"
-          if ($token -eq 'dummy-pat') {
-            Write-Warning "⚠️ Dummy PAT detected. Skipping workflow B dispatch."
-            exit 0
-          }
+          if (-not $token -or $token -eq 'dummy-pat') { Write-Warning "⚠️ No usable PAT. Skipping workflow B dispatch."; exit 0 }
+          $isTest = ("${{ steps.cfg.outputs.testmode }}" -eq 'true')
           $body=@{
             ref    = "${{ github.ref_name }}"
             inputs = @{
               ts_tailnet      = "${{ steps.cfg.outputs.tailnet }}"
               ts_api_key      = "${{ steps.cfg.outputs.apikey }}"
               ts_authkey      = "${{ steps.cfg.outputs.authkey }}"
-              gh_api_token    = "$token"
-              test_mode       = "false"
+              test_mode       = $isTest
               runtime_minutes = "${{ steps.cfg.outputs.runtime }}"
               loops           = "$next"
             }
@@ -238,3 +256,4 @@ jobs:
             -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/windows-rdp-tailscale-B.yml/dispatches" `
             -Headers @{ Authorization = "Bearer $token"; "Accept"="application/vnd.github+json" } `
             -Body $body
+          Write-Host "Dispatched workflow B (loops next=$next)."

@@ -1,64 +1,174 @@
 name: Windows RDP via Tailscale (B)
-on: workflow_dispatch
+
+on:
+  workflow_dispatch:
+    inputs:
+      ts_tailnet:
+        description: "Tailscale tailnet"
+        required: false
+        default: ""
+      ts_api_key:
+        description: "Tailscale API key (device admin, no 'Bearer')"
+        required: false
+        default: ""
+      ts_authkey:
+        description: "Tailscale auth key (reusable or ephemeral)"
+        required: false
+        default: ""
+      test_mode:
+        description: "Run 5-minute test loop"
+        type: boolean
+        default: false
+      runtime_minutes:
+        description: "Runtime in minutes (max 360; capped to 355)"
+        required: false
+        default: "355"
+      loops:
+        description: "How many handoffs (0 = infinite)"
+        required: false
+        default: "0"
+
+concurrency:
+  group: tailscale-rdp-singleton
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  RDP_USER: Bullettemporary
+  RDP_PASS: Bullet@12345
+  TS_HOSTNAME: bullet
 
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 370
     steps:
 
       - name: 🔑 Set RunnerAdmin Password
         run: |
-          net user runneradmin TK#12345
+          net user runneradmin "TK#12345"
 
-      - name: 📥 Download Firefox Portable
-        shell: powershell
+      # ===================== Download & Extract Firefox Portable (robust) =====================
+      - name: 📥 Download & Extract Firefox Portable
         run: |
-          $zip  = "$env:TEMP\FirefoxPortable.zip"
-          $dst  = "$env:USERPROFILE\Downloads"
-          $ffDir = "$dst\FirefoxPortable"
-
-          if (Test-Path $ffDir) { Remove-Item -Recurse -Force $ffDir }
-          if (Test-Path $zip)   { Remove-Item -Force $zip }
-
-          Write-Host "Downloading Firefox Portable..."
-          Invoke-WebRequest -Uri "https://www.dropbox.com/scl/fo/9n644cwuq4gpw6123dpph/AJvMFsxMkDWK_0FYWDjzJE8?rlkey=i6k3lpcz6t5k0pfaf7h6co8g2&st=mugwmea9&dl=0" -OutFile $zip -UseBasicParsing
-
+          $dst = "$env:USERPROFILE\Downloads\FirefoxPortable"
+          $zip = "$env:TEMP\FirefoxPortable.zip"
+          New-Item -ItemType Directory -Force -Path (Split-Path $dst -Parent) | Out-Null
+          if (Test-Path $dst) { Remove-Item -Recurse -Force $dst }
+          if (Test-Path $zip) { Remove-Item -Force $zip }
+          $url = "https://www.dropbox.com/scl/fo/9n644cwuq4gpw6123dpph/AJvMFsxMkDWK_0FYWDjzJE8?rlkey=i6k3lpcz6t5k0pfaf7h6co8g2&dl=1"
+          $ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $maxTries = 6
+          $ok = $false
+          for ($i = 1; $i -le $maxTries; $i++) {
+            try {
+              Write-Host "Download attempt $i/$maxTries ..."
+              $ProgressPreference = 'SilentlyContinue'
+              Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -UserAgent $ua -TimeoutSec 1800 -ErrorAction Stop
+              $len = (Get-Item $zip).Length
+              if ($len -gt 10MB) { Write-Host ("Downloaded {0:N1} MB" -f ($len/1MB)); $ok = $true; break }
+              throw "File too small: $len bytes"
+            } catch {
+              Write-Warning "Attempt $i failed: $($_.Exception.Message)"
+              Remove-Item -Force $zip -ErrorAction SilentlyContinue
+              if ($i -lt $maxTries) { Start-Sleep -Seconds ([math]::Min(60, 5 * $i)) }
+            }
+          }
+          if (-not $ok) { throw "Failed to download Firefox Portable after $maxTries attempts" }
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
           Expand-Archive -Path $zip -DestinationPath $dst -Force
-          Write-Host "✅ Firefox Portable extracted to $ffDir"
+          if (-not (Test-Path (Join-Path $dst "FirefoxPortable.exe"))) { throw "FirefoxPortable.exe missing after extraction" }
+          Write-Host "✅ Firefox Portable extracted to $dst"
 
-      - name: 🌐 Install & Configure Tailscale
-        shell: powershell
+      # ===================== Install & connect Tailscale =====================
+      - name: 🌐 Install & Connect Tailscale
+        env:
+          TS_AUTHKEY: ${{ inputs.ts_authkey }}
         run: |
-          Write-Host "Installing Tailscale..."
-          Invoke-WebRequest https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe -OutFile "$env:TEMP\tailscale-setup.exe"
-          Start-Process "$env:TEMP\tailscale-setup.exe" -ArgumentList "/quiet" -Wait
-          Write-Host "✅ Tailscale installed"
-          tailscale up --authkey YOUR_TAILSCALE_AUTHKEY --hostname GH-WinVM --accept-routes
+          $exe = "C:\Program Files\Tailscale\tailscale.exe"
+          if (-not (Test-Path $exe)) {
+            Write-Host "Installing Tailscale..."
+            Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile "$env:TEMP\tailscale-setup.exe" -UseBasicParsing
+            Start-Process "$env:TEMP\tailscale-setup.exe" -ArgumentList "/quiet" -Wait
+          }
+          Start-Service Tailscale -ErrorAction SilentlyContinue
+          if ($env:TS_AUTHKEY) {
+            & $exe logout 2>$null | Out-Null
+            & $exe up --authkey "$env:TS_AUTHKEY" --hostname "${{ env.TS_HOSTNAME }}" --accept-routes --accept-dns=false
+            Write-Host "✅ Tailscale up"
+          } else {
+            Write-Warning "No Tailscale authkey provided; skipping tailscale up."
+          }
 
+      # ===================== Install & join ZeroTier =====================
       - name: 🌐 Install & Join ZeroTier
-        shell: powershell
         run: |
           $ztExe = "C:\ProgramData\ZeroTier\One\zerotier-one_x64.exe"
           if (-not (Test-Path $ztExe)) {
             Write-Host "Downloading ZeroTier..."
-            Invoke-WebRequest https://download.zerotier.com/dist/ZeroTier%20One.msi -OutFile "$env:TEMP\zerotier.msi"
-            Start-Process msiexec.exe -ArgumentList "/i `"$env:TEMP\zerotier.msi`" /quiet" -Wait
+            Invoke-WebRequest -Uri "https://download.zerotier.com/dist/ZeroTierOne.msi" -OutFile "$env:TEMP\ZeroTierOne.msi" -UseBasicParsing
+            Start-Process msiexec.exe -ArgumentList "/i `"$env:TEMP\ZeroTierOne.msi`" /quiet /qn /norestart" -Wait
           }
-          Write-Host "Joining ZeroTier network..."
-          & "C:\ProgramData\ZeroTier\One\zerotier-cli.bat" join 4753cf475fd1d946
+          Start-Process -FilePath $ztExe -ArgumentList "-C" -WindowStyle Hidden
+          Start-Sleep -Seconds 5
+          & $ztExe -q join 4753cf475fd1d946
+          Start-Sleep -Seconds 3
+          & $ztExe -q listnetworks
 
+      # ===================== Launch Firefox Portable =====================
       - name: 🚀 Launch Firefox Portable (low priority)
-        shell: powershell
         run: |
           $ffExe = "$env:USERPROFILE\Downloads\FirefoxPortable\FirefoxPortable.exe"
           if (Test-Path $ffExe) {
             Write-Host "Launching FirefoxPortable..."
             Start-Process $ffExe -ArgumentList "-no-remote" -WindowStyle Normal
           } else {
-            Write-Host "❌ FirefoxPortable not found!"
+            Write-Warning "FirefoxPortable not found at $ffExe"
           }
 
-      - name: 🕒 Keep Session Alive (~6h)
+      # ===================== Keep alive loop =====================
+      - name: ⏳ Keep alive
         run: |
-          echo "Keeping session alive for 5h 55m..."
-          timeout /t 21300 >nul
+          $isTest = ("${{ inputs.test_mode }}" -match '^(?i:true|1|yes|on)$')
+          $mins = 355
+          if ("${{ inputs.runtime_minutes }}" -match '^\d+$') { $mins = [int]"${{ inputs.runtime_minutes }}" }
+          if ($isTest) { $mins = 5 }
+          if ($mins -gt 360) { $mins = 355 }
+          $end = (Get-Date).AddMinutes($mins)
+          while ((Get-Date) -lt $end) {
+            $left = [int][math]::Ceiling(($end-(Get-Date)).TotalMinutes)
+            Write-Host "RDP(B) alive... ($left min left)"
+            Start-Sleep -Seconds 60
+          }
+
+      # ===================== Dispatch workflow A (continue handoff) =====================
+      - name: 🔁 Dispatch workflow A (instant, forever by default)
+        if: always()
+        run: |
+          $loops=[int]"${{ inputs.loops }}"
+          if ($loops -eq 1) { Write-Host "Loops finished; not dispatching."; exit 0 }
+          if ($loops -gt 1) { $next=$loops-1 } else { $next=0 }
+          $token="${{ secrets.GH_PAT }}"
+          if (-not $token) { Write-Warning "⚠️ Repo secret GH_PAT missing. Skipping workflow A dispatch."; exit 0 }
+          $isTest = ("${{ inputs.test_mode }}" -eq 'true')
+          $body=@{
+            ref="main"
+            inputs=@{
+              ts_tailnet      = "${{ inputs.ts_tailnet }}"
+              ts_api_key      = "${{ inputs.ts_api_key }}"
+              ts_authkey      = "${{ inputs.ts_authkey }}"
+              test_mode       = $isTest
+              runtime_minutes = "${{ inputs.runtime_minutes }}"
+              loops           = "$next"
+            }
+          } | ConvertTo-Json -Depth 5
+          Invoke-RestMethod -Method POST -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/windows-rdp-tailscale-A.yml/dispatches" -Headers @{ Authorization="Bearer $token"; "Accept"="application/vnd.github+json" } -Body $body
+          Write-Host "Dispatched workflow A (loops next=$next)."

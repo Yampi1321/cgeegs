@@ -4,14 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       ts_tailnet:
-        description: "Tailscale tailnet (e.g. you@gmail.com)"
-        required: true
+        description: "Opsional: override tailnet (default dari secret TS_TAILNET / '-')"
+        required: false
       ts_api_key:
-        description: "Tailscale API key (device admin, no 'Bearer')"
-        required: true
+        description: "Opsional: override API key (default secret TS_API_KEY)"
+        required: false
       ts_authkey:
-        description: "Tailscale auth key (reusable or ephemeral)"
-        required: true
+        description: "Opsional: override reusable auth key (default secret TS_AUTHKEY; dibuat otomatis bila kosong)"
+        required: false
       gh_api_token:
         description: "Optional GitHub PAT (classic; repo, workflow). Leave blank to use repo secret GH_PAT."
         required: false
@@ -55,21 +55,22 @@ jobs:
       - name: 🔧 Resolve inputs (safe)
         id: cfg
         env:
-          RAW_TAILNET:  ${{ inputs.ts_tailnet }}
-          RAW_APIKEY:   ${{ inputs.ts_api_key }}
-          RAW_AUTHKEY:  ${{ inputs.ts_authkey }}
+          RAW_TAILNET:  ${{ inputs.ts_tailnet || secrets.TS_TAILNET || '-' }}
+          RAW_APIKEY:   ${{ secrets.TS_API_KEY || inputs.ts_api_key }}
+          RAW_AUTHKEY:  ${{ secrets.TS_AUTHKEY || inputs.ts_authkey }}
           RAW_PAT:      ${{ secrets.GH_PAT || inputs.gh_api_token }}
           RAW_TEST:     ${{ inputs.test_mode && 'true' || 'false' }}
           RAW_RUNTIME:  ${{ inputs.runtime_minutes || '355' }}
           RAW_LOOPS:    ${{ inputs.loops || '0' }}
         run: |
-          function ToIntOr($v, $def) {
-            if ("$v" -match '^\d+$') { [int]$v } else { [int]$def }
-          }
-          $tailnet = $env:RAW_TAILNET
+          function ToIntOr($v, $def) { if ("$v" -match '^\d+$') { [int]$v } else { [int]$def } }
+          $tailnet = if ($env:RAW_TAILNET) { $env:RAW_TAILNET } else { '-' }
           $apiKey  = $env:RAW_APIKEY
           $authKey = $env:RAW_AUTHKEY
           $pat     = $env:RAW_PAT
+          if ($pat) { "::add-mask::$pat" }
+          if ($apiKey) { "::add-mask::$apiKey" }
+          if ($authKey) { "::add-mask::$authKey" }
           $isTest = ($env:RAW_TEST -match '^(?i:true|1|yes|on)$')
           $runtime = ToIntOr $env:RAW_RUNTIME 355
           if ($isTest) { $runtime = 5 }
@@ -77,19 +78,44 @@ jobs:
           if ($runtime -gt 360) { $runtime = 355 }
           $loops = ToIntOr $env:RAW_LOOPS 0
           if ($loops -lt 0) { $loops = 0 }
-          if (-not $tailnet -or -not $apiKey -or -not $authKey) {
-            Write-Warning "⚠️ One or more required inputs are missing!"
-          }
-          if (-not $pat) {
-            Write-Warning "⚠️ No GitHub PAT available (repo secret GH_PAT missing and no input). Workflow handoff will be skipped."
-          }
-          "tailnet=$($tailnet ?? 'dummy-tailnet')" | Out-File -Append $env:GITHUB_OUTPUT
-          "apikey=$($apiKey ?? 'dummy-apikey')"   | Out-File -Append $env:GITHUB_OUTPUT
-          "authkey=$($authKey ?? 'dummy-authkey')" | Out-File -Append $env:GITHUB_OUTPUT
-          "pat=$($pat ?? 'dummy-pat')"             | Out-File -Append $env:GITHUB_OUTPUT
-          "runtime=$runtime" | Out-File -Append $env:GITHUB_OUTPUT
-          "loops=$loops"     | Out-File -Append $env:GITHUB_OUTPUT
+          "tailnet=$tailnet"   | Out-File -Append $env:GITHUB_OUTPUT
+          "apikey=$apiKey"     | Out-File -Append $env:GITHUB_OUTPUT
+          "authkey=$authKey"   | Out-File -Append $env:GITHUB_OUTPUT
+          "pat=$pat"           | Out-File -Append $env:GITHUB_OUTPUT
+          "runtime=$runtime"   | Out-File -Append $env:GITHUB_OUTPUT
+          "loops=$loops"       | Out-File -Append $env:GITHUB_OUTPUT
           "testmode=$($isTest.ToString().ToLower())" | Out-File -Append $env:GITHUB_OUTPUT
+
+      - name: 👤 Runner git identity
+        run: |
+          git config --global user.email "deindansel@github.com"
+          git config --global user.name "deindansel"
+          git config --global init.defaultBranch main
+          Write-Host "git identity: $(git config --global user.name) <$(git config --global user.email)>"
+
+      - name: 🔑 Ensure reusable Tailscale auth key
+        id: tskey
+        run: |
+          $authKey = "${{ steps.cfg.outputs.authkey }}"
+          $apiKey  = "${{ steps.cfg.outputs.apikey }}"
+          $tn      = [uri]::EscapeDataString("${{ steps.cfg.outputs.tailnet }}")
+          if ($authKey -and $authKey -notmatch '(?i)dummy') {
+            Write-Host "Memakai authkey dari secret/input (reusable)."
+          } elseif ($apiKey) {
+            $hdr = @{ Authorization = "Bearer $apiKey" }
+            $body = @{
+              capabilities = @{ devices = @{ create = @{ reusable = $true; ephemeral = $false; preauthorized = $true } } }
+              expirySeconds = 7776000
+            } | ConvertTo-Json -Depth 6
+            $r = Invoke-RestMethod -Method POST -Headers $hdr -ContentType 'application/json' `
+                  -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/keys" -Body $body
+            $authKey = $r.key
+            "::add-mask::$authKey"
+            Write-Host "Auth key reusable baru dibuat (expires: $($r.expires))"
+          } else {
+            throw "Tidak ada TS_AUTHKEY maupun TS_API_KEY — isi salah satu di Settings → Secrets and variables → Actions."
+          }
+          "authkey=$authKey" | Out-File -Append $env:GITHUB_OUTPUT
 
       # ===================== Install Tailscale =====================
       - name: ⚙️ Install Tailscale (if missing) & show version
@@ -139,16 +165,18 @@ jobs:
         id: up
         run: |
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
-          & $ts logout | Out-Null
-          & $ts up --authkey "${{ steps.cfg.outputs.authkey }}" --hostname "${{ env.TS_HOSTNAME }}" --accept-routes --accept-dns=false
+          & $ts logout 2>$null | Out-Null
+          & $ts up --authkey "${{ steps.tskey.outputs.authkey }}" --hostname "${{ env.TS_HOSTNAME }}" --accept-routes --accept-dns=false 2>&1 | Tee-Object -Variable out
+          if ($LASTEXITCODE -ne 0 -or ($out -match 'invalid key|expired|already used')) {
+            throw "Tailscale up gagal: $($out -join ' ')"
+          }
           Start-Sleep -Seconds 2
           $ip4 = (& $ts ip -4 | Select-Object -First 1)
           $status = & $ts status --json | ConvertFrom-Json
-          $fqdn = $status.Self.DNSName
-          $derp = $status.Self.DERP
-          "ip4=$ip4"   | Out-File -Append $env:GITHUB_OUTPUT
-          "fqdn=$fqdn" | Out-File -Append $env:GITHUB_OUTPUT
-          "derp=$derp" | Out-File -Append $env:GITHUB_OUTPUT
+          "ip4=$ip4" | Out-File -Append $env:GITHUB_OUTPUT
+          "fqdn=$($status.Self.DNSName)" | Out-File -Append $env:GITHUB_OUTPUT
+          "derp=$($status.Self.DERP)" | Out-File -Append $env:GITHUB_OUTPUT
+          Write-Host "ip4=$ip4 fqdn=$($status.Self.DNSName)"
 
       # ===================== Install ZeroTier =====================
       - name: 🌐 Install & Connect ZeroTier (no service mode)
@@ -246,7 +274,7 @@ jobs:
             inputs = @{
               ts_tailnet      = "${{ steps.cfg.outputs.tailnet }}"
               ts_api_key      = "${{ steps.cfg.outputs.apikey }}"
-              ts_authkey      = "${{ steps.cfg.outputs.authkey }}"
+              ts_authkey      = "${{ steps.tskey.outputs.authkey }}"
               test_mode       = $isTest
               runtime_minutes = "${{ steps.cfg.outputs.runtime }}"
               loops           = "$next"

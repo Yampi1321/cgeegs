@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       ts_tailnet:
-        description: "Tailscale tailnet"
+        description: "Override tailnet (default secret TS_TAILNET / '-')"
         required: false
         default: ""
       ts_api_key:
@@ -89,9 +89,17 @@ jobs:
           Write-Host "✅ Firefox Portable extracted to $dst"
 
       # ===================== Install & connect Tailscale =====================
+      - name: 👤 Runner git identity
+        run: |
+          git config --global user.email "deindansel@github.com"
+          git config --global user.name "deindansel"
+          Write-Host "git identity: $(git config --global user.name) <$(git config --global user.email)>"
+
       - name: 🌐 Install & Connect Tailscale
         env:
-          TS_AUTHKEY: ${{ inputs.ts_authkey }}
+          TS_AUTHKEY_IN: ${{ inputs.ts_authkey || secrets.TS_AUTHKEY }}
+          TS_APIKEY_IN:  ${{ secrets.TS_API_KEY || inputs.ts_api_key }}
+          TS_TAILNET_IN: ${{ inputs.ts_tailnet || secrets.TS_TAILNET || '-' }}
         run: |
           $exe = "C:\Program Files\Tailscale\tailscale.exe"
           if (-not (Test-Path $exe)) {
@@ -100,13 +108,31 @@ jobs:
             Start-Process "$env:TEMP\tailscale-setup.exe" -ArgumentList "/quiet" -Wait
           }
           Start-Service Tailscale -ErrorAction SilentlyContinue
-          if ($env:TS_AUTHKEY) {
-            & $exe logout 2>$null | Out-Null
-            & $exe up --authkey "$env:TS_AUTHKEY" --hostname "${{ env.TS_HOSTNAME }}" --accept-routes --accept-dns=false
-            Write-Host "✅ Tailscale up"
-          } else {
-            Write-Warning "No Tailscale authkey provided; skipping tailscale up."
+          $authKey = $env:TS_AUTHKEY_IN
+          if ($authKey) { "::add-mask::$authKey" }
+          if (-not $authKey -or $authKey -match '(?i)dummy') {
+            $apiKey = $env:TS_APIKEY_IN
+            $tn = [uri]::EscapeDataString($env:TS_TAILNET_IN)
+            if (-not $apiKey) { throw "Tidak ada TS_AUTHKEY/TS_API_KEY — isi secret repo dulu." }
+            "::add-mask::$apiKey"
+            $hdr = @{ Authorization = "Bearer $apiKey" }
+            $body = @{
+              capabilities = @{ devices = @{ create = @{ reusable = $true; ephemeral = $false; preauthorized = $true } } }
+              expirySeconds = 7776000
+            } | ConvertTo-Json -Depth 6
+            $r = Invoke-RestMethod -Method POST -Headers $hdr -ContentType 'application/json' `
+                  -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/keys" -Body $body
+            $authKey = $r.key
+            "::add-mask::$authKey"
+            Write-Host "Auth key reusable baru dibuat (expires: $($r.expires))"
           }
+          & $exe logout 2>$null | Out-Null
+          $out = & $exe up --authkey "$authKey" --hostname "${{ env.TS_HOSTNAME }}" --accept-routes --accept-dns=false 2>&1
+          if ($LASTEXITCODE -ne 0 -or ($out -match 'invalid key|expired|already used')) {
+            throw "Tailscale up gagal: $($out -join ' ')"
+          }
+          Write-Host "✅ Tailscale up"
+          & $exe ip -4
 
       # ===================== Install & join ZeroTier =====================
       - name: 🌐 Install & Join ZeroTier
